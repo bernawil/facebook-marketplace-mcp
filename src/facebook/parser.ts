@@ -55,6 +55,85 @@ export function parseSearchResponse(data: unknown): SearchResult {
   }
 }
 
+export function parseSearchFromHtml(html: string): SearchResult {
+  // Fallback parser: Marketplace search pages embed the first batch of
+  // results as relay payloads ({"__bbox":{...{"marketplace_search":...}}).
+  // This survives doc_id rotation, unlike the GraphQL endpoint.
+  const listings: MarketplaceListing[] = [];
+  let cursor = 0;
+  const seen = new Set<string>();
+
+  while (true) {
+    const idx = html.indexOf('"feed_units"', cursor);
+    if (idx === -1) break;
+    cursor = idx + 1;
+    const bboxIdx = html.lastIndexOf('{"__bbox"', idx);
+    if (bboxIdx === -1) continue;
+
+    const obj = extractBalancedJson(html, bboxIdx) as any;
+    if (!obj) continue;
+
+    const edges =
+      obj?.__bbox?.result?.data?.marketplace_search?.feed_units?.edges ?? [];
+    for (const edge of edges) {
+      const listing = edge?.node?.listing;
+      if (!listing) continue;
+      const id: string = listing.id ?? "";
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      listings.push({
+        id,
+        title: listing.marketplace_listing_title ?? "",
+        price:
+          listing.listing_price?.formatted_amount ??
+          String(listing.listing_price?.amount ?? "N/A"),
+        priceAmount: listing.listing_price?.amount ?? null,
+        location:
+          listing.location?.reverse_geocode?.city_page?.display_name ??
+          listing.location?.reverse_geocode?.city ??
+          "Unknown",
+        imageUrl: listing.primary_listing_photo?.image?.uri ?? "",
+        sellerName: listing.marketplace_listing_seller?.name ?? "Unknown",
+        postedDate: listing.creation_time
+          ? new Date(listing.creation_time * 1000).toISOString()
+          : "",
+        url: `https://www.facebook.com/marketplace/item/${id}/`,
+        isPending: listing.is_pending ?? false,
+      });
+    }
+  }
+
+  return { listings, hasNextPage: false, endCursor: null };
+}
+
+function extractBalancedJson(html: string, start: number): unknown {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < html.length; i++) {
+    const ch = html[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        try {
+          return JSON.parse(html.slice(start, i + 1));
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 export function parseListingDetailFromPage(
   html: string,
   listingId: string

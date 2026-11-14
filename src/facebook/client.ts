@@ -16,7 +16,7 @@ import {
   buildSearchVariables,
   buildLocationSearchVariables,
 } from "./queries.js";
-import { parseSearchResponse, parseListingDetailFromPage } from "./parser.js";
+import { parseSearchResponse, parseSearchFromHtml, parseListingDetailFromPage } from "./parser.js";
 import { RateLimiter } from "../utils/rate-limit.js";
 
 const GRAPHQL_URL = "https://www.facebook.com/api/graphql/";
@@ -210,8 +210,68 @@ export class FacebookClient {
 
   async searchListings(params: SearchParams): Promise<SearchResult> {
     const variables = buildSearchVariables(params);
-    const data = await this.graphqlRequest(MARKETPLACE_SEARCH_DOC_ID, variables);
-    return parseSearchResponse(data);
+    let data: unknown = null;
+    try {
+      data = await this.graphqlRequest(MARKETPLACE_SEARCH_DOC_ID, variables);
+    } catch {
+      // doc_id may be stale after a Facebook deploy — fall back to the
+      // server-rendered search page below.
+    }
+    const result = parseSearchResponse(data);
+    if (result.listings.length > 0) return result;
+    return this.searchListingsFromPage(params);
+  }
+
+  /**
+   * Fallback: fetch the Marketplace search page and parse the relay payload
+   * embedded in the HTML. Facebook rotates GraphQL doc_ids on deploys, but
+   * the SSR page always contains the first batch of results.
+   *
+   * Caveats: the page searches around the account's saved Marketplace
+   * location (ignoring latitude/longitude/radius_km) and returns no price
+   * filtering, so min/max price and limit are applied locally afterwards.
+   */
+  private async searchListingsFromPage(
+    params: SearchParams
+  ): Promise<SearchResult> {
+    const session = await this.ensureSession();
+    await this.rateLimiter.wait();
+
+    const url = `https://www.facebook.com/marketplace/search/?query=${encodeURIComponent(
+      params.query
+    )}&exact=false`;
+    const res = await fetch(url, {
+      headers: {
+        ...BROWSER_HEADERS,
+        Cookie: session.cookieHeader,
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      },
+      redirect: "follow",
+    });
+
+    if (!res.ok) {
+      throw new Error(`Failed to fetch search page: ${res.status} ${res.statusText}`);
+    }
+
+    const html = await res.text();
+    let result = parseSearchFromHtml(html);
+
+    result = {
+      ...result,
+      listings: result.listings
+        .filter((l) => {
+          if (l.priceAmount == null) return true;
+          if (params.minPrice != null && l.priceAmount < params.minPrice)
+            return false;
+          if (params.maxPrice != null && l.priceAmount > params.maxPrice)
+            return false;
+          return true;
+        })
+        .slice(0, params.limit),
+    };
+
+    return result;
   }
 
   async getListingDetail(listingId: string): Promise<MarketplaceListingDetail> {

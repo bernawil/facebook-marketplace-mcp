@@ -22,6 +22,8 @@ export interface MarketplaceListing {
   id: string;
   title: string;
   price: string;
+  /** Numeric price in the listing currency's major units, when available. */
+  priceAmount?: number | null;
   location: string;
   imageUrl: string;
   sellerName: string;
